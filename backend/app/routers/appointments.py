@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Any
 from app.database import get_db
-from app.utils.rbac import get_current_user, require_role
+from app.utils.rbac import get_current_user
 
 router = APIRouter(prefix="/api/appointments", tags=["Appointments"])
 
@@ -29,41 +29,53 @@ class AppointmentUpdate(BaseModel):
 
 def serialize_appointment(doc: dict) -> dict:
     """Bulletproof serializer for MongoDB appointment records."""
-    doc["id"] = str(doc.pop("_id"))
-    doc["patient_id"] = str(doc.get("patient_id") or "N/A")
-    doc["doctor_id"] = str(doc.get("doctor_id") or "N/A")
-    doc["department"] = doc.get("department") or "General"
-    doc["reason"] = doc.get("reason") or "Consultation"
-    doc["status"] = doc.get("status") or "scheduled"
-    doc["cancellation_reason"] = doc.get("cancellation_reason")
+    if not doc:
+        return {}
+
+    data = dict(doc)
+
+    # Safe ID resolution
+    if "_id" in data:
+        data["id"] = str(data.pop("_id"))
+    elif "id" in data:
+        data["id"] = str(data["id"])
+    else:
+        data["id"] = "N/A"
+
+    data["patient_id"] = str(data.get("patient_id") or "N/A")
+    data["doctor_id"] = str(data.get("doctor_id") or "N/A")
+    data["department"] = data.get("department") or "General"
+    data["reason"] = data.get("reason") or "Consultation"
+    data["status"] = data.get("status") or "scheduled"
+    data["cancellation_reason"] = data.get("cancellation_reason")
 
     # Normalize appointment_date to ISO string
-    raw_date = doc.get("appointment_date")
+    raw_date = data.get("appointment_date")
     if isinstance(raw_date, datetime):
-        doc["appointment_date"] = raw_date.isoformat()
+        data["appointment_date"] = raw_date.isoformat()
     elif isinstance(raw_date, str):
-        doc["appointment_date"] = raw_date
+        data["appointment_date"] = raw_date
     else:
-        doc["appointment_date"] = datetime.now(timezone.utc).isoformat()
+        data["appointment_date"] = datetime.now(timezone.utc).isoformat()
 
     # Normalize created_at to ISO string
-    raw_created = doc.get("created_at")
+    raw_created = data.get("created_at")
     if isinstance(raw_created, datetime):
-        doc["created_at"] = raw_created.isoformat()
+        data["created_at"] = raw_created.isoformat()
     elif isinstance(raw_created, str):
-        doc["created_at"] = raw_created
+        data["created_at"] = raw_created
     else:
-        doc["created_at"] = datetime.now(timezone.utc).isoformat()
+        data["created_at"] = datetime.now(timezone.utc).isoformat()
 
-    return doc
+    return data
 
 
 async def check_booking_conflict(db, doctor_id: str, target_time: Any, exclude_id: Optional[str] = None):
-    """Prevents overlapping appointments for the same doctor."""
+    """Prevents overlapping appointments for the same doctor across both BSON Date and ISO string formats."""
     if not doctor_id or doctor_id == "N/A":
         return
 
-    # Parse date safely
+    # Parse target_time safely into a UTC datetime
     if isinstance(target_time, str):
         try:
             target_dt = datetime.fromisoformat(target_time.replace("Z", "+00:00"))
@@ -74,18 +86,23 @@ async def check_booking_conflict(db, doctor_id: str, target_time: Any, exclude_i
     else:
         return
 
-    # Normalize to UTC naive or aware for safe window calculation
     if target_dt.tzinfo is not None:
         target_dt = target_dt.astimezone(timezone.utc).replace(tzinfo=None)
 
     buffer_start = target_dt - timedelta(minutes=29)
     buffer_end = target_dt + timedelta(minutes=29)
 
+    time_conditions = [
+        {"appointment_date": {"$gte": buffer_start, "$lte": buffer_end}},
+        {"appointment_date": {"$gte": buffer_start.isoformat(), "$lte": buffer_end.isoformat()}}
+    ]
+
     query = {
         "doctor_id": doctor_id,
         "status": "scheduled",
-        "appointment_date": {"$gte": buffer_start, "$lte": buffer_end}
+        "$or": time_conditions
     }
+
     if exclude_id:
         try:
             query["_id"] = {"$ne": ObjectId(exclude_id)}
@@ -96,7 +113,7 @@ async def check_booking_conflict(db, doctor_id: str, target_time: Any, exclude_i
     if existing:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Doctor already has a scheduled consultation around this time. Please choose a different slot."
+            detail="Doctor already has a scheduled consultation around this time. Please select a different slot."
         )
 
 
@@ -121,14 +138,26 @@ async def create_appointment(
 
     await check_booking_conflict(db, payload.doctor_id, payload.appointment_date)
 
+    raw_date = payload.appointment_date
+    if isinstance(raw_date, str):
+        try:
+            parsed_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00")).astimezone(timezone.utc).replace(tzinfo=None)
+        except Exception:
+            parsed_date = datetime.now(timezone.utc).replace(tzinfo=None)
+    elif isinstance(raw_date, datetime):
+        parsed_date = raw_date.astimezone(timezone.utc).replace(tzinfo=None) if raw_date.tzinfo else raw_date
+    else:
+        parsed_date = datetime.now(timezone.utc).replace(tzinfo=None)
+
     doc_data = payload.model_dump()
+    doc_data["appointment_date"] = parsed_date
     doc_data["patient_id"] = str(current_user["_id"])
     doc_data["status"] = "scheduled"
     doc_data["created_at"] = datetime.now(timezone.utc)
 
     res = await db["appointments"].insert_one(doc_data)
-    doc_data["id"] = str(res.inserted_id)
-    doc_data.pop("_id", None)
+    doc_data["_id"] = res.inserted_id
+
     return serialize_appointment(doc_data)
 
 
@@ -170,17 +199,38 @@ async def update_appointment(
     if not apt:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Appointment not found")
 
+    user_role = current_user.get("role", "patient").lower()
     update_fields = {}
 
     if payload.appointment_date:
         await check_booking_conflict(db, apt.get("doctor_id", "N/A"), payload.appointment_date, exclude_id=appointment_id)
-        update_fields["appointment_date"] = payload.appointment_date
+        
+        raw_date = payload.appointment_date
+        if isinstance(raw_date, str):
+            try:
+                parsed_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00")).astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception:
+                parsed_date = datetime.now(timezone.utc).replace(tzinfo=None)
+        elif isinstance(raw_date, datetime):
+            parsed_date = raw_date.astimezone(timezone.utc).replace(tzinfo=None) if raw_date.tzinfo else raw_date
+        else:
+            parsed_date = datetime.now(timezone.utc).replace(tzinfo=None)
+            
+        update_fields["appointment_date"] = parsed_date
 
     if payload.status:
         valid_statuses = ["scheduled", "completed", "cancelled"]
-        if payload.status.lower() not in valid_statuses:
+        new_status = payload.status.lower()
+        if new_status not in valid_statuses:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid status value")
-        update_fields["status"] = payload.status.lower()
+        
+        # Patients cannot mark consultations as completed
+        if user_role == "patient" and new_status == "completed":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only doctors or administrators can mark an appointment as completed."
+            )
+        update_fields["status"] = new_status
 
     if payload.cancellation_reason:
         update_fields["cancellation_reason"] = payload.cancellation_reason
@@ -195,13 +245,32 @@ async def update_appointment(
 @router.delete("/{appointment_id}", status_code=status.HTTP_200_OK)
 async def delete_appointment(
     appointment_id: str,
-    current_user: dict = Depends(require_role(["admin"])),
+    current_user: dict = Depends(get_current_user),
     db = Depends(get_db)
 ):
     try:
         oid = ObjectId(appointment_id)
     except InvalidId:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid appointment ID format")
+
+    apt = await db["appointments"].find_one({"_id": oid})
+    if not apt:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Appointment not found")
+
+    user_role = current_user.get("role", "patient").lower()
+    user_id = str(current_user["_id"])
+
+    if user_role != "admin":
+        if str(apt.get("patient_id")) != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to delete this appointment."
+            )
+        if apt.get("status") != "scheduled":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You can only delete appointments while they are in 'scheduled' status."
+            )
 
     res = await db["appointments"].delete_one({"_id": oid})
     if res.deleted_count == 0:
